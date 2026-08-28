@@ -13,5 +13,5 @@ make
 run with:
 
 ```bash
-./cube
+./shapes
 ```
