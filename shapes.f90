@@ -80,9 +80,9 @@ program fortran_shape_lab
   integer(c_int), parameter :: SIGTERM = 15_c_int
   integer(c_long), parameter :: TIOCGWINSZ = int(z'5413', c_long)
   real(real64), parameter :: target_frame_time = 1.0_real64 / real(target_fps, real64)
-  real(real32), parameter :: PI = 3.14159265358979323846_real32
+  real(real32), parameter :: PI = 3.1415927_real32
   character(len=1), parameter :: ESC = achar(27)
-  character(len=3), parameter :: UPPER_HALF = achar(226)//achar(150)//achar(128)
+  character(len=3), parameter :: UPPER_HALF = '▀'
 
   type(mesh_type) :: mesh
   type(theme_type) :: theme
@@ -96,14 +96,14 @@ program fortran_shape_lab
   integer :: frame_number, used_bytes, shape_id, theme_id
   integer(int64) :: clock_rate, frame_start, frame_end, previous_start
   real(real64) :: dt, elapsed, sleep_time, t
-  real(real32) :: yaw, pitch, roll, camera_distance
-  real(real32) :: inertia_yaw, inertia_pitch, auto_speed, interaction_quiet
+  real(real32) :: orientation(3,3), angular_velocity(3), drag_vector(3)
+  real(real32) :: camera_distance, auto_speed, interaction_quiet, inertia_speed
   logical :: auto_rotate, show_hud, force_redraw
   type(c_funptr) :: previous_handler
 
   integer :: input_state, mouse_len
   character(len=64) :: mouse_text
-  logical :: dragging
+  logical :: dragging, mouse_present, mouse_over_object
   integer :: mouse_x, mouse_y
 
   call init_decimal_table()
@@ -115,18 +115,18 @@ program fortran_shape_lab
   previous_handler = c_signal(SIGINT, c_funloc(handle_signal))
   previous_handler = c_signal(SIGTERM, c_funloc(handle_signal))
 
-  yaw = 0.62_real32
-  pitch = -0.34_real32
-  roll = 0.08_real32
+  call rotation_matrix(-0.34_real32, 0.62_real32, 0.08_real32, orientation)
   camera_distance = 5.0_real32
-  inertia_yaw = 0.0_real32
-  inertia_pitch = 0.0_real32
+  angular_velocity = 0.0_real32
+  drag_vector = [0.0_real32,0.0_real32,-1.0_real32]
   auto_speed = 1.0_real32
   interaction_quiet = 0.0_real32
   auto_rotate = .true.
   show_hud = .true.
   force_redraw = .true.
   dragging = .false.
+  mouse_present = .false.
+  mouse_over_object = .false.
   input_state = 0
   mouse_len = 0
   mouse_text = ''
@@ -140,7 +140,7 @@ program fortran_shape_lab
 
   call execute_command_line('stty -echo -icanon min 0 time 0', wait=.true.)
   write(output_unit,'(A)',advance='no') ESC//'[?1049h'//ESC//'[?25l'//ESC//'[?7l'// &
-       ESC//'[?1002h'//ESC//'[?1006h'//ESC//'[2J'
+       ESC//'[?1003h'//ESC//'[?1006h'//ESC//'[2J'
   flush(output_unit)
 
   call system_clock(previous_start, clock_rate)
@@ -175,22 +175,28 @@ program fortran_shape_lab
     interaction_quiet = max(0.0_real32, interaction_quiet - real(dt,real32))
 
     if (.not. dragging) then
-      yaw = yaw + inertia_yaw * real(dt,real32)
-      pitch = pitch + inertia_pitch * real(dt,real32)
-      inertia_yaw = inertia_yaw * exp(-3.35_real32 * real(dt,real32))
-      inertia_pitch = inertia_pitch * exp(-3.35_real32 * real(dt,real32))
+      inertia_speed=sqrt(dot_product(angular_velocity,angular_velocity))
+      if(inertia_speed>1.0e-4_real32) &
+        call apply_orientation_delta(angular_velocity/inertia_speed,inertia_speed*real(dt,real32))
+      angular_velocity = angular_velocity * exp(-3.35_real32 * real(dt,real32))
     end if
 
     if (auto_rotate .and. .not. dragging .and. interaction_quiet <= 0.0_real32) then
-      yaw = yaw + 0.58_real32 * auto_speed * real(dt,real32)
-      roll = roll + 0.075_real32 * auto_speed * real(dt,real32)
+      call apply_orientation_delta([0.0_real32,1.0_real32,0.0_real32], &
+        0.58_real32*auto_speed*real(dt,real32))
+      call apply_orientation_delta([0.0_real32,0.0_real32,1.0_real32], &
+        0.075_real32*auto_speed*real(dt,real32))
     end if
-    pitch = max(-1.45_real32, min(1.45_real32, pitch))
 
     pixels = background
     zbuffer = huge(1.0_real32)
 
-    call render_frame(cols, rows, ph, real(t,real32), yaw, pitch, roll)
+    call render_frame(cols, ph, real(t,real32), orientation)
+    call draw_shape_outline(cols, ph)
+    if (mouse_present) then
+      call cursor_hits_shape(mouse_x, mouse_y, mouse_over_object)
+      call draw_interaction_cursor(cols, ph, mouse_x, mouse_y, mouse_over_object, dragging)
+    end if
     call build_frame_delta(cols, rows, used_bytes, force_redraw)
 
     write(output_unit,'(A)',advance='no') ESC//'[?2026h'
@@ -207,7 +213,7 @@ program fortran_shape_lab
     if (sleep_time > 0.0005_real64) call c_usleep(int(sleep_time*1000000.0_real64,c_int))
   end do
 
-  write(output_unit,'(A)',advance='no') ESC//'[?2026l'//ESC//'[?1006l'//ESC//'[?1002l'// &
+  write(output_unit,'(A)',advance='no') ESC//'[?2026l'//ESC//'[?1006l'//ESC//'[?1003l'//ESC//'[?1002l'// &
        ESC//'[0m'//ESC//'[?7h'//ESC//'[?25h'//ESC//'[?1049l'
   flush(output_unit)
   call execute_command_line('stty echo icanon', wait=.true.)
@@ -236,9 +242,9 @@ contains
     case(2)
       call init_icosahedron(m)
     case(3)
-      call init_sphere(m, 10, 20)
+      call init_sphere(m, 16, 32)
     case(4)
-      call init_torus(m, 24, 12)
+      call init_torus(m, 36, 18)
     case default
       call init_tetrahedron(m)
     end select
@@ -497,19 +503,18 @@ contains
     force_redraw=.true.
   end subroutine rebuild_background
 
-  subroutine render_frame(w,terminal_rows,height,time,ax,ay,az)
-    integer,intent(in)::w,terminal_rows,height
-    real(real32),intent(in)::time,ax,ay,az
+  subroutine render_frame(w,height,time,rot)
+    integer,intent(in)::w,height
+    real(real32),intent(in)::time,rot(3,3)
     real(real32),allocatable::world(:,:),wn(:,:),sx(:),sy(:),depth(:)
     logical,allocatable::ok(:)
-    real(real32)::rot(3,3),bob,face_n(3),centroid(3),camera_pos(3)
+    real(real32)::bob,face_n(3),centroid(3),camera_pos(3)
     real(real32)::shadow_x,shadow_y,shadow_depth,object_scale
     logical::shadow_ok
     integer::i,ti,eidx,ids(3),base_col(3)
     real(real32)::edge_pulse
 
     allocate(world(3,mesh%nv),wn(3,mesh%nv),sx(mesh%nv),sy(mesh%nv),depth(mesh%nv),ok(mesh%nv))
-    call rotation_matrix(ax,ay,az,rot)
     bob=0.075_real32*sin(time*1.15_real32)
     object_scale=merge(1.03_real32,1.0_real32,mesh%smooth)
     do i=1,mesh%nv
@@ -542,12 +547,12 @@ contains
         call fill_lit_triangle(w,height, &
           sx(ids(1)),sy(ids(1)),depth(ids(1)),world(:,ids(1)),wn(:,ids(1)), &
           sx(ids(2)),sy(ids(2)),depth(ids(2)),world(:,ids(2)),wn(:,ids(2)), &
-          sx(ids(3)),sy(ids(3)),depth(ids(3)),world(:,ids(3)),wn(:,ids(3)),base_col,time)
+          sx(ids(3)),sy(ids(3)),depth(ids(3)),world(:,ids(3)),wn(:,ids(3)),base_col)
       else
         call fill_lit_triangle(w,height, &
           sx(ids(1)),sy(ids(1)),depth(ids(1)),world(:,ids(1)),face_n, &
           sx(ids(2)),sy(ids(2)),depth(ids(2)),world(:,ids(2)),face_n, &
-          sx(ids(3)),sy(ids(3)),depth(ids(3)),world(:,ids(3)),face_n,base_col,time)
+          sx(ids(3)),sy(ids(3)),depth(ids(3)),world(:,ids(3)),face_n,base_col)
       end if
     end do
 
@@ -640,14 +645,14 @@ contains
     end do
   end subroutine draw_soft_shadow
 
-  subroutine fill_lit_triangle(w,height,x0,y0,z0,p0,n0,x1,y1,z1,p1,n1,x2,y2,z2,p2,n2,base_col,time)
+  subroutine fill_lit_triangle(w,height,x0,y0,z0,p0,n0,x1,y1,z1,p1,n1,x2,y2,z2,p2,n2,base_col)
     integer,intent(in)::w,height,base_col(3)
-    real(real32),intent(in)::x0,y0,z0,p0(3),n0(3),x1,y1,z1,p1(3),n1(3),x2,y2,z2,p2(3),n2(3),time
+    real(real32),intent(in)::x0,y0,z0,p0(3),n0(3),x1,y1,z1,p1(3),n1(3),x2,y2,z2,p2(3),n2(3)
     integer::minx,maxx,miny,maxy,x,y,out_col(3)
     real(real32)::area,sgn,area_abs,px,py,e0,e1,e2,b0,b1,b2,q0,q1,q2,denom,depth
     real(real32)::pos(3),normal(3),view(3),ldir(3),camera_pos(3),radiance(3),linear(3),base(3)
-    real(real32)::dist2,ndotv,hemi,fresnel,fog,noise,coat,coat_ndh
-    real(real32)::mapped(3),fogc(3),hdir(3)
+    real(real32)::dist2,ndotv,fresnel,fog,noise,coat,coat_ndh,mixv
+    real(real32)::mapped(3),fogc(3),hdir(3),base_a_linear(3),base_b_linear(3)
 
     minx=max(1,int(floor(min(x0,min(x1,x2))))); maxx=min(w,int(ceiling(max(x0,max(x1,x2)))))
     miny=max(1,int(floor(min(y0,min(y1,y2))))); maxy=min(height,int(ceiling(max(y0,max(y1,y2)))))
@@ -656,6 +661,8 @@ contains
     if(abs(area)<1.0e-7_real32)return
     sgn=merge(-1.0_real32,1.0_real32,area<0.0_real32); area_abs=area*sgn
     base=(real(base_col,real32)/255.0_real32)**2.2_real32
+    base_a_linear=(real(theme%base_a,real32)/255.0_real32)**2.2_real32
+    base_b_linear=(real(theme%base_b,real32)/255.0_real32)**2.2_real32
     camera_pos=[0.0_real32,0.0_real32,-camera_distance]
     fogc=(real(theme%sky_horizon,real32)/255.0_real32)**2.2_real32
 
@@ -673,6 +680,11 @@ contains
         if(depth>=zbuffer(x,y))cycle
         pos=(q0*p0+q1*p1+q2*p2)*depth
         normal=normalize3((q0*n0+q1*n1+q2*n2)*depth)
+        if(mesh%smooth)then
+          mixv=clamp01(.24_real32+.30_real32*(normal(2)*.5_real32+.5_real32)+ &
+                       .10_real32*(normal(1)*.5_real32+.5_real32))
+          base=base_a_linear*(1.0_real32-mixv)+base_b_linear*mixv
+        end if
         view=normalize3(camera_pos-pos); ndotv=max(.001_real32,dot_product(normal,view))
 
         linear=base*theme%ambient*(.62_real32+.38_real32*(normal(2)*.5_real32+.5_real32))
@@ -746,6 +758,99 @@ contains
     end do
   end subroutine draw_glowing_line
 
+  subroutine draw_shape_outline(w,height)
+    integer,intent(in)::w,height
+    integer::x,y
+    logical::boundary,near_surface
+    real(real32)::empty_depth
+
+    empty_depth=huge(1.0_real32)*.5_real32
+
+    ! A restrained halo outside the silhouette softens the one-cell terminal edge.
+    do y=2,height-1
+      do x=2,w-1
+        if(zbuffer(x,y)<empty_depth)cycle
+        near_surface=zbuffer(x-1,y)<empty_depth .or. zbuffer(x+1,y)<empty_depth .or. &
+                     zbuffer(x,y-1)<empty_depth .or. zbuffer(x,y+1)<empty_depth
+        if(near_surface)call add_pixel(x,y,theme%edge_rgb,.075_real32)
+      end do
+    end do
+
+    ! Keep every mesh readable against both the bright horizon and dark floor.
+    do y=1,height
+      do x=1,w
+        if(zbuffer(x,y)>=empty_depth)cycle
+        boundary=x==1 .or. x==w .or. y==1 .or. y==height
+        if(.not.boundary)then
+          boundary=zbuffer(x-1,y)>=empty_depth .or. zbuffer(x+1,y)>=empty_depth .or. &
+                   zbuffer(x,y-1)>=empty_depth .or. zbuffer(x,y+1)>=empty_depth
+        end if
+        if(boundary)call blend_pixel(x,y,theme%edge_rgb,.42_real32)
+      end do
+    end do
+  end subroutine draw_shape_outline
+
+  subroutine cursor_hits_shape(cell_x,cell_y,hit)
+    integer,intent(in)::cell_x,cell_y
+    logical,intent(out)::hit
+    integer::py
+    real(real32)::empty_depth
+
+    hit=.false.
+    if(cell_x<1 .or. cell_x>cols .or. cell_y<1 .or. cell_y>rows)return
+    py=max(1,min(rows*2,(cell_y-1)*2+1))
+    empty_depth=huge(1.0_real32)*.5_real32
+    hit=zbuffer(cell_x,py)<empty_depth .or. zbuffer(cell_x,min(py+1,rows*2))<empty_depth
+  end subroutine cursor_hits_shape
+
+  subroutine draw_interaction_cursor(w,height,cell_x,cell_y,over_shape,active)
+    integer,intent(in)::w,height,cell_x,cell_y
+    logical,intent(in)::over_shape,active
+    integer::x,y,cx,cy,dx,dy,color(3),shadow(3)
+    real(real32)::distance,radius
+
+    cx=cell_x
+    cy=(cell_y-1)*2+1
+    if(cx<1 .or. cx>w .or. cy<1 .or. cy>height)return
+
+    shadow=[1,3,8]
+    if(active)then
+      color=[255,255,255]
+      radius=4.1_real32
+    else if(over_shape)then
+      color=theme%edge_rgb
+      radius=3.25_real32
+    else
+      color=nint(.62_real32*real(theme%edge_rgb,real32)+.38_real32*real(theme%grid_rgb,real32))
+      radius=3.25_real32
+    end if
+
+    do y=max(1,cy-6),min(height,cy+6)
+      do x=max(1,cx-6),min(w,cx+6)
+        dx=x-cx;dy=y-cy
+        distance=sqrt(real(dx*dx+dy*dy,real32))
+        if(abs(distance-radius)<1.05_real32)call blend_pixel(x,y,shadow,.76_real32)
+        if(abs(distance-radius)<.48_real32)call blend_pixel(x,y,color,.92_real32)
+      end do
+    end do
+
+    ! The open center keeps the target visible; short ticks make drag direction obvious.
+    do dx=-1,1
+      x=cx+dx
+      if(x>=1 .and. x<=w)then
+        call blend_pixel(x,cy,shadow,.72_real32)
+        call blend_pixel(x,cy,color,.88_real32)
+      end if
+    end do
+    do dy=-1,1
+      y=cy+dy
+      if(y>=1 .and. y<=height)then
+        call blend_pixel(cx,y,shadow,.72_real32)
+        call blend_pixel(cx,y,color,.88_real32)
+      end if
+    end do
+  end subroutine draw_interaction_cursor
+
   subroutine project_point(point,w,height,sx,sy,depth,ok)
     real(real32),intent(in)::point(3)
     integer,intent(in)::w,height
@@ -759,6 +864,65 @@ contains
     sy=real(height,real32)*.47_real32-point(2)*scale/depth
     ok=.true.
   end subroutine project_point
+
+  subroutine apply_orientation_delta(axis,angle)
+    real(real32),intent(in)::axis(3),angle
+    real(real32)::delta(3,3),axis_length
+
+    axis_length=sqrt(dot_product(axis,axis))
+    if(axis_length<1.0e-6_real32 .or. abs(angle)<1.0e-6_real32)return
+    call axis_angle_matrix(axis/axis_length,angle,delta)
+    orientation=matmul(delta,orientation)
+    call orthonormalize_orientation()
+  end subroutine apply_orientation_delta
+
+  subroutine axis_angle_matrix(axis,angle,matrix)
+    real(real32),intent(in)::axis(3),angle
+    real(real32),intent(out)::matrix(3,3)
+    real(real32)::x,y,z,c,s,t
+
+    x=axis(1);y=axis(2);z=axis(3)
+    c=cos(angle);s=sin(angle);t=1.0_real32-c
+    matrix(1,1)=t*x*x+c
+    matrix(1,2)=t*x*y-s*z
+    matrix(1,3)=t*x*z+s*y
+    matrix(2,1)=t*x*y+s*z
+    matrix(2,2)=t*y*y+c
+    matrix(2,3)=t*y*z-s*x
+    matrix(3,1)=t*x*z-s*y
+    matrix(3,2)=t*y*z+s*x
+    matrix(3,3)=t*z*z+c
+  end subroutine axis_angle_matrix
+
+  subroutine orthonormalize_orientation()
+    real(real32)::x_axis(3),y_axis(3),z_axis(3)
+
+    x_axis=normalize3(orientation(:,1))
+    y_axis=orientation(:,2)-dot_product(orientation(:,2),x_axis)*x_axis
+    y_axis=normalize3(y_axis)
+    z_axis=normalize3(cross3(x_axis,y_axis))
+    y_axis=normalize3(cross3(z_axis,x_axis))
+    orientation(:,1)=x_axis
+    orientation(:,2)=y_axis
+    orientation(:,3)=z_axis
+  end subroutine orthonormalize_orientation
+
+  subroutine trackball_vector(cell_x,cell_y,vector)
+    integer,intent(in)::cell_x,cell_y
+    real(real32),intent(out)::vector(3)
+    real(real32)::screen_x,screen_y,radius,distance2
+
+    radius=max(4.0_real32,min(real(cols,real32),real(rows*2,real32))*.42_real32)
+    screen_x=(real(cell_x,real32)-real(cols,real32)*.5_real32)/radius
+    screen_y=(real(rows*2,real32)*.47_real32-real((cell_y-1)*2+1,real32))/radius
+    distance2=screen_x*screen_x+screen_y*screen_y
+    if(distance2<=1.0_real32)then
+      vector=[screen_x,screen_y,-sqrt(max(0.0_real32,1.0_real32-distance2))]
+    else
+      vector=[screen_x/sqrt(distance2),screen_y/sqrt(distance2),0.0_real32]
+    end if
+    vector=normalize3(vector)
+  end subroutine trackball_vector
 
   subroutine rotation_matrix(ax,ay,az,matrix)
     real(real32),intent(in)::ax,ay,az
@@ -886,14 +1050,77 @@ contains
   end subroutine append_glyph
 
   subroutine write_hud()
-    character(len=220)::line
-    integer::n
-    write(line,'(A,A,A,A,A,F3.1,A)') ' ',trim(mesh%name),'  |  ',trim(theme%name), &
-         '  |  drag  wheel zoom  WASD rotate  [1-5] shape  T theme  SPACE spin  Q quit  zoom ',camera_distance,' '
-    n=len_trim(line)
-    write(output_unit,'(A)',advance='no') ESC//'[1;1H'//ESC//'[0m'//ESC//'[48;2;0;0;0m'// &
-         ESC//'[38;2;235;241;250m'//line(1:n)//ESC//'[0m'
+    character(len=160)::identity,status,help_text
+    character(len=12)::motion
+    integer::bg(3),accent_bg(3),fg(3),muted(3),status_col,identity_col
+
+    bg=min(theme%floor_rgb+[7,8,12],[32,34,42])
+    accent_bg=min(nint(.28_real32*real(theme%base_a,real32)+.72_real32*real(bg,real32)),[86,86,94])
+    fg=theme%edge_rgb
+    muted=nint(.62_real32*real(fg,real32)+.38_real32*real(bg,real32))
+    motion=merge('AUTO        ','PAUSED      ',auto_rotate)
+    write(identity,'(A,A,A)')trim(mesh%name),'  /  ',trim(theme%name)
+    write(status,'(A,A,F3.1,A,F3.1)')trim(motion),'  ',auto_speed,'x  |  zoom ',camera_distance
+
+    call paint_hud_row(1,bg)
+    call write_hud_text(1,2,' SHAPE LAB ',fg,accent_bg,.true.)
+    identity_col=15
+    call write_hud_text(1,identity_col,trim(identity),fg,bg,.true.)
+    status_col=cols-len_trim(status)
+    if(status_col>identity_col+len_trim(identity)+2) &
+      call write_hud_text(1,status_col,trim(status),muted,bg,.false.)
+
+    if(cols>=117)then
+      help_text=' DRAG free rotate   WHEEL zoom   ARROWS / WASD rotate   1-5 shape   T theme'// &
+                '   SPACE pause   R reset   H hide   Q quit'
+    else if(cols>=78)then
+      help_text=' DRAG free rotate  WHEEL zoom  WASD rotate  1-5 shape  T theme  Q quit  H hide'
+    else if(cols>=47)then
+      help_text=' DRAG free  WHEEL zoom  1-5 shape  Q quit  H UI'
+    else
+      help_text=' DRAG free  WHEEL zoom  Q quit  H UI'
+    end if
+    call paint_hud_row(rows,bg)
+    call write_hud_text(rows,1,trim(help_text),muted,bg,.false.)
+    write(output_unit,'(A)',advance='no')ESC//'[0m'
   end subroutine write_hud
+
+  subroutine paint_hud_row(row,bg)
+    integer,intent(in)::row,bg(3)
+    character(len=:),allocatable::blank
+    allocate(character(len=cols)::blank)
+    blank(:)=' '
+    call move_terminal_cursor(row,1)
+    call set_hud_style([232,238,247],bg,.false.)
+    write(output_unit,'(A)',advance='no')blank
+  end subroutine paint_hud_row
+
+  subroutine write_hud_text(row,col,text_value,fg,bg,bold)
+    integer,intent(in)::row,col,fg(3),bg(3)
+    character(len=*),intent(in)::text_value
+    logical,intent(in)::bold
+    integer::n
+    if(col<1 .or. col>cols)return
+    n=min(len_trim(text_value),cols-col+1)
+    if(n<=0)return
+    call move_terminal_cursor(row,col)
+    call set_hud_style(fg,bg,bold)
+    write(output_unit,'(A)',advance='no')text_value(1:n)
+  end subroutine write_hud_text
+
+  subroutine move_terminal_cursor(row,col)
+    integer,intent(in)::row,col
+    write(output_unit,'(A,I0,A,I0,A)',advance='no')ESC//'[',row,';',col,'H'
+  end subroutine move_terminal_cursor
+
+  subroutine set_hud_style(fg,bg,bold)
+    integer,intent(in)::fg(3),bg(3)
+    logical,intent(in)::bold
+    write(output_unit,'(A)',advance='no')ESC//'[0m'
+    if(bold)write(output_unit,'(A)',advance='no')ESC//'[1m'
+    write(output_unit,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A)',advance='no') &
+      ESC//'[38;2;',fg(1),';',fg(2),';',fg(3),';48;2;',bg(1),';',bg(2),';',bg(3),'m'
+  end subroutine set_hud_style
 
   subroutine poll_input(frame_dt)
     real(real32),intent(in)::frame_dt
@@ -927,6 +1154,7 @@ contains
       if(ch=='<')then
         input_state=3;mouse_len=0;mouse_text=''
       else
+        call handle_arrow_key(ch)
         input_state=0
       end if
     case(3)
@@ -952,8 +1180,9 @@ contains
     case('t','T')
       theme_id=1+mod(theme_id,max_theme); call load_theme(theme_id,theme); call rebuild_background()
     case('r','R')
-      yaw=.62_real32;pitch=-.34_real32;roll=.08_real32;camera_distance=5.0_real32
-      inertia_yaw=0.0_real32;inertia_pitch=0.0_real32;interaction_quiet=.8_real32;force_redraw=.true.
+      call rotation_matrix(-.34_real32,.62_real32,.08_real32,orientation)
+      camera_distance=5.0_real32;angular_velocity=0.0_real32
+      interaction_quiet=.8_real32;force_redraw=.true.
     case('h','H')
       show_hud=.not.show_hud; force_redraw=.true.
     case('[','-')
@@ -961,32 +1190,60 @@ contains
     case(']','+')
       auto_speed=min(3.0_real32,auto_speed+.15_real32)
     case('a','A')
-      yaw=yaw-.12_real32; interaction_quiet=.5_real32
+      call apply_orientation_delta([0.0_real32,1.0_real32,0.0_real32],.12_real32)
+      angular_velocity=0.0_real32;interaction_quiet=.5_real32
     case('d','D')
-      yaw=yaw+.12_real32; interaction_quiet=.5_real32
+      call apply_orientation_delta([0.0_real32,1.0_real32,0.0_real32],-.12_real32)
+      angular_velocity=0.0_real32;interaction_quiet=.5_real32
     case('w','W')
-      pitch=max(-1.45_real32,pitch-.10_real32); interaction_quiet=.5_real32
+      call apply_orientation_delta([1.0_real32,0.0_real32,0.0_real32],.10_real32)
+      angular_velocity=0.0_real32;interaction_quiet=.5_real32
     case('s','S')
-      pitch=min(1.45_real32,pitch+.10_real32); interaction_quiet=.5_real32
+      call apply_orientation_delta([1.0_real32,0.0_real32,0.0_real32],-.10_real32)
+      angular_velocity=0.0_real32;interaction_quiet=.5_real32
     case('z','Z')
       camera_distance=max(3.15_real32,camera_distance-.25_real32); interaction_quiet=.5_real32
     case('x','X')
       camera_distance=min(9.0_real32,camera_distance+.25_real32); interaction_quiet=.5_real32
     case('1','2','3','4','5')
       read(ch,*)v; shape_id=v; call load_shape(shape_id,mesh); interaction_quiet=.45_real32; force_redraw=.true.
+    case('n','N')
+      shape_id=1+mod(shape_id,max_shape);call load_shape(shape_id,mesh)
+      interaction_quiet=.45_real32;force_redraw=.true.
     end select
   end subroutine handle_key
+
+  subroutine handle_arrow_key(ch)
+    character(len=1),intent(in)::ch
+    select case(ch)
+    case('A')
+      call apply_orientation_delta([1.0_real32,0.0_real32,0.0_real32],.10_real32)
+    case('B')
+      call apply_orientation_delta([1.0_real32,0.0_real32,0.0_real32],-.10_real32)
+    case('C')
+      call apply_orientation_delta([0.0_real32,1.0_real32,0.0_real32],-.12_real32)
+    case('D')
+      call apply_orientation_delta([0.0_real32,1.0_real32,0.0_real32],.12_real32)
+    case default
+      return
+    end select
+    angular_velocity=0.0_real32;interaction_quiet=.5_real32
+  end subroutine handle_arrow_key
 
   subroutine handle_mouse(text,released,frame_dt)
     character(len=*),intent(in)::text
     logical,intent(in)::released
     real(real32),intent(in)::frame_dt
     character(len=64)::tmp
-    integer::i,ios,b,x,y,base,dx,dy,py
+    integer::i,ios,b,x,y,base,dx,dy
+    real(real32)::current_vector(3),axis(3),axis_length,angle,dot_value,speed
     tmp='';tmp(1:min(len_trim(text),len(tmp)))=text(1:min(len_trim(text),len(tmp)))
     do i=1,len_trim(tmp);if(tmp(i:i)==';')tmp(i:i)=' ';end do
     read(tmp,*,iostat=ios)b,x,y
     if(ios/=0)return
+    if(x>=1 .and. x<=cols .and. y>=1 .and. y<=rows)then
+      mouse_present=.true.
+    end if
     base=iand(b,3)
     if(iand(b,64)/=0)then
       if(iand(b,1)==0)then
@@ -994,29 +1251,39 @@ contains
       else
         camera_distance=min(9.0_real32,camera_distance+.28_real32)
       end if
+      mouse_x=x;mouse_y=y
       interaction_quiet=.7_real32;force_redraw=.true.;return
     end if
     if(released)then
+      mouse_x=x;mouse_y=y
       dragging=.false.;interaction_quiet=.85_real32;return
     end if
     if(iand(b,32)/=0 .and. dragging)then
       dx=x-mouse_x;dy=y-mouse_y
       if(abs(dx)<=40.and.abs(dy)<=25)then
-        yaw=yaw+real(dx,real32)*.033_real32
-        pitch=pitch+real(dy,real32)*.050_real32
-        inertia_yaw=clamp_real(real(dx,real32)*.033_real32/max(frame_dt,.008_real32),-7.0_real32,7.0_real32)
-        inertia_pitch=clamp_real(real(dy,real32)*.050_real32/max(frame_dt,.008_real32),-6.0_real32,6.0_real32)
+        call trackball_vector(x,y,current_vector)
+        axis=cross3(drag_vector,current_vector)
+        axis_length=sqrt(dot_product(axis,axis))
+        dot_value=clamp_real(dot_product(drag_vector,current_vector),-1.0_real32,1.0_real32)
+        if(axis_length>1.0e-5_real32)then
+          angle=atan2(axis_length,dot_value)
+          axis=axis/axis_length
+          call apply_orientation_delta(axis,angle)
+          speed=min(8.0_real32,angle/max(frame_dt,.008_real32))
+          angular_velocity=axis*speed
+        end if
+        drag_vector=current_vector
       end if
       mouse_x=x;mouse_y=y;interaction_quiet=.85_real32;return
     end if
+    if(iand(b,32)/=0)then
+      mouse_x=x;mouse_y=y;return
+    end if
     if(base==0)then
-      py=max(1,min(rows*2,(y-1)*2+1))
-      if(x>=1.and.x<=cols.and.y>=1.and.y<=rows)then
-        if(zbuffer(x,py)<huge(1.0_real32)*.5_real32 .or. &
-           zbuffer(x,min(py+1,rows*2))<huge(1.0_real32)*.5_real32)then
-          dragging=.true.;mouse_x=x;mouse_y=y;inertia_yaw=0.0_real32;inertia_pitch=0.0_real32
-          interaction_quiet=.85_real32
-        end if
+      if(x>=1.and.x<=cols.and.y>1.and.y<rows)then
+        dragging=.true.;mouse_x=x;mouse_y=y;angular_velocity=0.0_real32
+        call trackball_vector(x,y,drag_vector)
+        interaction_quiet=.85_real32
       end if
     end if
   end subroutine handle_mouse
